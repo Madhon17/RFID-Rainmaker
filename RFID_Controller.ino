@@ -51,6 +51,7 @@ std::vector<CardEntry> cards;
 // =================== RainMaker ===================
 static Node my_node;
 static Device my_dev("RFID_Controller");  // custom device
+static uint8_t wifiLed = 2;  //D2
 
 // Nama parameter
 const char *P_STATUS      = "Status";
@@ -245,17 +246,20 @@ void exitToNormal(bool fromTimeout=false) {
 }
 
 // =================== RainMaker Callbacks ===================
-void sysProvEvent(arduino_event_t *sys_event)
-{
+void sysProvEvent(arduino_event_t *sys_event) {
   switch (sys_event->event_id) {
     case ARDUINO_EVENT_PROV_START:
 #if CONFIG_IDF_TARGET_ESP32
+      Serial.printf("\nProvisioning Started with name \"%s\" and PoP \"%s\" on BLE\n", service_name, pop);
       printQR(service_name, pop, "ble");
 #else
+      Serial.printf("\nProvisioning Started with name \"%s\" and PoP \"%s\" on SoftAP\n", service_name, pop);
       printQR(service_name, pop, "softap");
 #endif
       break;
-    default:
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.printf("\nConnected to Wi-Fi!\n");
+      digitalWrite(wifiLed, true);
       break;
   }
 }
@@ -382,14 +386,12 @@ void setup() {
   RMaker.start();
 
   // Provisioning BLE
-  WiFi.onEvent(sysProvEvent);
+WiFi.onEvent(sysProvEvent);
+  // Use NETWORK_PROV constants used by Arduino RainMaker/WiFiProv wrapper
 #if CONFIG_IDF_TARGET_ESP32
-  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
-                        NETWORK_PROV_SECURITY_1, pop, service_name);
+  WiFiProv.beginProvision(WIFI_PROV_SCHEME_BLE, WIFI_PROV_SCHEME_HANDLER_FREE_BTDM, WIFI_PROV_SECURITY_1, pop, service_name);
 #else
-  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
-                        NETWORK_PROV_SECURITY_1, pop, service_name);
-
+  WiFiProv.beginProvision(WIFI_PROV_SCHEME_SOFTAP, WIFI_PROV_SCHEME_HANDLER_NONE, WIFI_PROV_SECURITY_1, pop, service_name);
 #endif
 
   // tampilkan initial list
