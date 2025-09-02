@@ -1,14 +1,15 @@
 /*
  * ESP32 RFID + 8 Relay + ESP RainMaker (v2.0.0)
  * Fitur:
- * - 1 Device berisi:
+ * - Device "RFID_Controller":
  *   Status (text, RO), AddMode (bool), RemoveMode (bool),
- *   Mark1..Mark8 (bool), Relay1..Relay8 (bool),
- *   ListCards (text, RO), LastAccess (text, RO)
+ *   Mark1..Mark8 (bool), ListCards (text, RO), LastAccess (text, RO)
+ * - Device "Relay_Controller":
+ *   Relay1..Relay8 (bool)
  * - AddMode/RemoveMode auto-off setelah sukses, atau timeout tanpa tap -> kembali Normal + buzzer 3x
  * - Saat Normal: tap kartu -> cek izin (mask), ON relay-relay terkait 5 detik (auto-off)
  * - Buzzer pola: add, remove, granted, denied, timeout(3x)
- * - Data kartu & mask disimpan di NVS (Preferences), tulis hanya saat add/remove (lebih aman untuk wear)
+ * - Data kartu & mask disimpan di NVS (Preferences)
  * - Provisioning Wi-Fi via RainMaker App (BLE)
  */
 
@@ -24,12 +25,12 @@
 
 // =================== Pin Mapping ===================
 #define SS_PIN         5    // MFRC522 SS (SDA)
-#define RST_PIN        16   // MFRC522 RST
-#define BUZZER_PIN     4    // Buzzer aktif HIGH
+#define RST_PIN        22   // MFRC522 RST
+#define BUZZER_PIN     15    // Buzzer aktif HIGH
 
-// 8 pin relay (hindari konflik SPI & strapping pins)
-const int RELAY_PINS[8] = {21, 22, 25, 26, 13, 14, 33, 32};
-#define RELAY_ACTIVE_HIGH  true  // ubah ke false jika relay board aktif LOW
+// 8 pin relay
+const int RELAY_PINS[8] = {21, 12, 25, 26, 13, 14, 33, 32};
+#define RELAY_ACTIVE_HIGH  false  // ubah ke false jika relay board aktif LOW
 
 // =================== RFID ===================
 MFRC522 mfrc522(SS_PIN, RST_PIN);
@@ -38,20 +39,22 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 Preferences prefs;
 const char *NVS_NS = "rfid";
 const char *NVS_KEY_COUNT = "count";  // uint16_t
-// kunci per entri: "u00","m00" .. "uNN","mNN" (u=uid (string), m=mask (uint8_t))
 #define MAX_CARDS 64
 
 struct CardEntry {
-  String uid;     // HEX uppercase tanpa spasi
-  uint8_t mask;   // bit0=Relay1 ... bit7=Relay8
+  String uid;     
+  uint8_t mask;   
 };
 #include <vector>
 std::vector<CardEntry> cards;
 
 // =================== RainMaker ===================
 static Node my_node;
-static Device my_dev("RFID_Controller");  // custom device
+static Device rfid_dev("RFID_Controller");   // Device utama
+static Device relay_dev("Relay_Controller"); // Device baru
 static uint8_t wifiLed = 2;  //D2
+
+
 
 // Nama parameter
 const char *P_STATUS      = "Status";
@@ -66,8 +69,8 @@ bool removeMode = false;
 bool mark[8] = {false,false,false,false,false,false,false,false};
 bool relayState[8] = {false,false,false,false,false,false,false,false};
 unsigned long relayOffAt[8] = {0,0,0,0,0,0,0,0};
-const char *P_MARK[8]  = {"Mark1","Mark2","Mark3","Mark4","Mark5","Mark6","Mark7","Mark8"};
-const char *P_RELAY[8] = {"Relay1","Relay2","Relay3","Relay4","Relay5","Relay6","Relay7","Relay8"};
+const char *P_MARK[8]  = {"LT1","LT2","LT3","LT4","LT5","LT6","LT7","LT8"};
+const char *P_RELAY[8] = {"LT1","LT2","LT3","LT4","LT5","LT6","LT7","LT8"};
 
 // Mode timeout
 const uint32_t MODE_TIMEOUT_MS = 15000;
@@ -83,16 +86,16 @@ void buzzOnce(uint16_t onMs) {
   delay(onMs);
   digitalWrite(BUZZER_PIN, LOW);
 }
-void buzzer_add()      { buzzOnce(120); delay(60); buzzOnce(60); }         // 2 nada (panjang+pendek)
-void buzzer_remove()   { buzzOnce(60);  delay(60); buzzOnce(60); }         // 2 pendek
-void buzzer_granted()  { buzzOnce(200); }                                  // 1 panjang
-void buzzer_denied()   { buzzOnce(60); }                                   // 1 pendek
-void buzzer_timeout3() { buzzOnce(60); delay(80); buzzOnce(60); delay(80); buzzOnce(60); } // 3x
+void buzzer_add()      { buzzOnce(120); delay(60); buzzOnce(60); }
+void buzzer_remove()   { buzzOnce(60);  delay(60); buzzOnce(60); }
+void buzzer_granted()  { buzzOnce(200); }
+void buzzer_denied()   { buzzOnce(60); }
+void buzzer_timeout3() { buzzOnce(60); delay(80); buzzOnce(60); delay(80); buzzOnce(60); }
 
 // =================== Util: Waktu ===================
 String formatTimeNow() {
   time_t now = time(nullptr);
-  if (now < 1600000000) { // belum sync
+  if (now < 1600000000) {
     return String("NTP_SYNCING");
   }
   struct tm tm_info;
@@ -107,8 +110,8 @@ void setRelay(int idx, bool on) {
   if (idx < 0 || idx >= 8) return;
   relayState[idx] = on;
   digitalWrite(RELAY_PINS[idx], (RELAY_ACTIVE_HIGH ? (on ? HIGH : LOW) : (on ? LOW : HIGH)));
-  // pantulkan ke app
-  my_dev.updateAndReportParam(P_RELAY[idx], (bool)on);
+  // pantulkan ke app (device relay)
+  relay_dev.updateAndReportParam(P_RELAY[idx], (bool)on);
 }
 
 void pulseRelayAutoOff(int idx, uint32_t ms = 5000) {
@@ -166,18 +169,18 @@ String buildListCardsText() {
 
 void updateStatus(const char *st) {
   statusStr = st;
-  my_dev.updateAndReportParam(P_STATUS, (char*)statusStr.c_str());
+  rfid_dev.updateAndReportParam(P_STATUS, (char*)statusStr.c_str());
 }
 
 void updateListCardsParam() {
   String text = buildListCardsText();
-  my_dev.updateAndReportParam(P_LISTCARDS, (char*)text.c_str());
+  rfid_dev.updateAndReportParam(P_LISTCARDS, (char*)text.c_str());
 }
 
 void updateLastAccessParam(const String &uid, bool granted, uint8_t mask) {
   String s = uid + " | " + formatTimeNow() + " | " + (granted ? "GRANTED " : "DENIED ");
   if (granted) { s += "["; s += maskToList(mask); s += "]"; }
-  my_dev.updateAndReportParam(P_LASTACCESS, (char*)s.c_str());
+  rfid_dev.updateAndReportParam(P_LASTACCESS, (char*)s.c_str());
 }
 
 // =================== NVS Save/Load ===================
@@ -186,7 +189,6 @@ void saveCardsToNVS() {
   uint16_t prev = prefs.getUShort(NVS_KEY_COUNT, 0);
   uint16_t cnt = (cards.size() > MAX_CARDS) ? MAX_CARDS : (uint16_t)cards.size();
   prefs.putUShort(NVS_KEY_COUNT, cnt);
-  // simpan ulang
   for (uint16_t i=0;i<cnt;i++) {
     char ku[8], km[8];
     snprintf(ku, sizeof(ku), "u%02u", i);
@@ -194,7 +196,6 @@ void saveCardsToNVS() {
     prefs.putString(ku, cards[i].uid);
     prefs.putUChar(km, cards[i].mask);
   }
-  // bersihkan sisa lama (kalau dulu lebih banyak)
   for (uint16_t i=cnt;i<prev;i++) {
     char ku[8], km[8];
     snprintf(ku, sizeof(ku), "u%02u", i);
@@ -236,14 +237,30 @@ void enterRemoveMode() {
   updateStatus("REMOVE_MODE");
 }
 
+//void exitToNormal(bool fromTimeout=false) {
+  //addMode = false; removeMode = false;
+  //updateStatus("NORMAL");
+  //rfid_dev.updateAndReportParam(P_ADD_MODE, false);
+  //rfid_dev.updateAndReportParam(P_REMOVE_MODE, false);
+  //if (fromTimeout) buzzer_timeout3();
+//}
+
 void exitToNormal(bool fromTimeout=false) {
-  addMode = false; removeMode = false;
+  addMode = false; 
+  removeMode = false;
   updateStatus("NORMAL");
-  // pantulkan switch ke OFF
-  my_dev.updateAndReportParam(P_ADD_MODE, false);
-  my_dev.updateAndReportParam(P_REMOVE_MODE, false);
+  rfid_dev.updateAndReportParam(P_ADD_MODE, false);
+  rfid_dev.updateAndReportParam(P_REMOVE_MODE, false);
+
+  // 🔹 Reset semua mark ke false
+  for (int i = 0; i < 8; i++) {
+    mark[i] = false;
+    rfid_dev.updateAndReportParam(P_MARK[i], false);
+  }
+
   if (fromTimeout) buzzer_timeout3();
 }
+
 
 // =================== RainMaker Callbacks ===================
 void sysProvEvent(arduino_event_t *sys_event) {
@@ -257,12 +274,19 @@ void sysProvEvent(arduino_event_t *sys_event) {
       printQR(service_name, pop, "softap");
 #endif
       break;
+
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.printf("\nConnected to Wi-Fi!\n");
-      digitalWrite(wifiLed, true);
+      Serial.println("\nConnected to Wi-Fi!");
+      digitalWrite(wifiLed, HIGH);  // LED ON
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("\nDisconnected from Wi-Fi!");
+      digitalWrite(wifiLed, LOW);   // LED OFF
       break;
   }
 }
+
 
 void write_callback(Device *device, Param *param, const param_val_t val, void *priv, write_ctx_t *ctx)
 {
@@ -306,8 +330,7 @@ void write_callback(Device *device, Param *param, const param_val_t val, void *p
     }
   }
 
-  // Read-only params ignored (Status/ListCards/LastAccess)
-  // just reflect back current value if needed
+  // RO param reflect back
   param_val_t cur;
   if (!strcmp(pname, P_STATUS)) { cur = value((char*)statusStr.c_str()); param->updateAndReport(cur); }
   if (!strcmp(pname, P_LISTCARDS)) { String t = buildListCardsText(); cur = value((char*)t.c_str()); param->updateAndReport(cur); }
@@ -317,6 +340,9 @@ void write_callback(Device *device, Param *param, const param_val_t val, void *p
 void setup() {
   Serial.begin(115200);
 
+  pinMode(wifiLed, OUTPUT);
+  digitalWrite(wifiLed, LOW);  // awalnya OFF
+
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
   for (int i=0;i<8;i++) {
@@ -324,83 +350,70 @@ void setup() {
     setRelay(i, false);
   }
 
-  // RFID
-  SPI.begin();      // default SCK=18, MISO=19, MOSI=23
+  SPI.begin();
   mfrc522.PCD_Init();
 
-  // Load cards from NVS
   loadCardsFromNVS();
 
-  // ===== RainMaker Node & Device =====
   my_node = RMaker.initNode("ESP32_RFID_Controller");
 
-  // Status (text, RO)
+  // Device 1: RFID_Controller
   {
     Param p(P_STATUS, NULL, value((char*)"NORMAL"), PROP_FLAG_READ);
     p.addUIType(ESP_RMAKER_UI_TEXT);
-    my_dev.addParam(p);
+    rfid_dev.addParam(p);
   }
-  // AddMode / RemoveMode (toggle)
   {
     Param p1(P_ADD_MODE, NULL, value(false), PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
     p1.addUIType(ESP_RMAKER_UI_TOGGLE);
-    my_dev.addParam(p1);
+    rfid_dev.addParam(p1);
     Param p2(P_REMOVE_MODE, NULL, value(false), PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
     p2.addUIType(ESP_RMAKER_UI_TOGGLE);
-    my_dev.addParam(p2);
+    rfid_dev.addParam(p2);
   }
-  // Mark1..Mark8 (toggle)
   for (int i=0;i<8;i++) {
     Param pm(P_MARK[i], NULL, value(false), PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
     pm.addUIType(ESP_RMAKER_UI_TOGGLE);
-    my_dev.addParam(pm);
+    rfid_dev.addParam(pm);
   }
-  // Relay1..Relay8 (toggle manual)
-  for (int i=0;i<8;i++) {
-    Param pr(P_RELAY[i], NULL, value(false), PROP_FLAG_READ | PROP_FLAG_WRITE);
-    pr.addUIType(ESP_RMAKER_UI_TOGGLE);
-    my_dev.addParam(pr);
-  }
-  // ListCards / LastAccess (text RO)
   {
     Param p3(P_LISTCARDS, NULL, value((char*)buildListCardsText().c_str()), PROP_FLAG_READ);
     p3.addUIType(ESP_RMAKER_UI_TEXT);
-    my_dev.addParam(p3);
+    rfid_dev.addParam(p3);
     Param p4(P_LASTACCESS, NULL, value((char*)"-"), PROP_FLAG_READ);
     p4.addUIType(ESP_RMAKER_UI_TEXT);
-    my_dev.addParam(p4);
+    rfid_dev.addParam(p4);
   }
+  rfid_dev.addCb(write_callback);
+  my_node.addDevice(rfid_dev);
 
-  // Callback tulis
-  my_dev.addCb(write_callback);
+  // Device 2: Relay_Controller
+  for (int i=0;i<8;i++) {
+    Param pr(P_RELAY[i], NULL, value(false), PROP_FLAG_READ | PROP_FLAG_WRITE);
+    pr.addUIType(ESP_RMAKER_UI_TOGGLE);
+    relay_dev.addParam(pr);
+  }
+  relay_dev.addCb(write_callback);
+  my_node.addDevice(relay_dev);
 
-  // Tambah device ke node
-  my_node.addDevice(my_dev);
-
-  // Opsional: OTA & waktu (untuk LastAccess)
   RMaker.enableOTA(OTA_USING_PARAMS);
   RMaker.setTimeZone("Asia/Jakarta");
   RMaker.enableSchedule();
 
-  // Mulai agent
   RMaker.start();
 
-  // Provisioning BLE
-WiFi.onEvent(sysProvEvent);
-  // Use NETWORK_PROV constants used by Arduino RainMaker/WiFiProv wrapper
+  WiFi.onEvent(sysProvEvent);
 #if CONFIG_IDF_TARGET_ESP32
   WiFiProv.beginProvision(WIFI_PROV_SCHEME_BLE, WIFI_PROV_SCHEME_HANDLER_FREE_BTDM, WIFI_PROV_SECURITY_1, pop, service_name);
 #else
   WiFiProv.beginProvision(WIFI_PROV_SCHEME_SOFTAP, WIFI_PROV_SCHEME_HANDLER_NONE, WIFI_PROV_SECURITY_1, pop, service_name);
 #endif
 
-  // tampilkan initial list
   updateListCardsParam();
 }
 
 // =================== Loop ===================
 void loop() {
-  // ---------- Auto-off relay ----------
   uint32_t now = millis();
   for (int i=0;i<8;i++) {
     if (relayOffAt[i] && (int32_t)(now - relayOffAt[i]) >= 0) {
@@ -409,16 +422,13 @@ void loop() {
     }
   }
 
-  // ---------- Mode timeout ----------
   if ((addMode || removeMode) && (now - modeStartMs >= MODE_TIMEOUT_MS)) {
-    exitToNormal(true); // buzzer 3x
+    exitToNormal(true);
   }
 
-  // ---------- RFID read ----------
   if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
     String uid = uidToString(mfrc522.uid);
     mfrc522.PICC_HaltA();
-
     int idx = findCardIndex(uid);
 
     if (addMode) {
@@ -448,7 +458,6 @@ void loop() {
       exitToNormal(false);
     }
     else {
-      // NORMAL
       if (idx >= 0 && cards[idx].mask != 0) {
         uint8_t m = cards[idx].mask;
         for (int i=0;i<8;i++) if (m & (1<<i)) {
